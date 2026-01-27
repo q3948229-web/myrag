@@ -46,19 +46,22 @@ def sql_exact_search(query_text):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 尝试匹配 "第X条" 或 "第X章"
+    # 尝试匹配 "第X条"
     match_article = re.search(r'第[一二三四五六七八九十百]+条', query_text)
     if match_article:
         article_num = match_article.group()
-        cursor.execute("SELECT path, content FROM handbook_nodes WHERE number = ?", (article_num,))
+        # 匹配新数据库中的 article_num 字段
+        cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_num = ?", (article_num,))
         res = cursor.fetchone()
         if res:
             return f"【SQL精确找到 {res[0]}】：\n{res[1]}"
             
+    # 尝试匹配 "第X章"
     match_chapter = re.search(r'第[一二三四五六七八九十百]+章', query_text)
     if match_chapter:
         chapter_num = match_chapter.group()
-        cursor.execute("SELECT title, content FROM handbook_nodes WHERE title LIKE ?", (f'%{chapter_num}%',))
+        # 模糊匹配章节名
+        cursor.execute("SELECT chapter, raw_content FROM handbook_nodes WHERE chapter LIKE ?", (f'%{chapter_num}%',))
         res = cursor.fetchone()
         if res:
             return f"【SQL精确找到 {res[0]}】：\n{res[1]}"
@@ -78,40 +81,8 @@ def build_vector_index():
     if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
         return faiss.read_index(INDEX_FILE), pickle.load(open(METADATA_FILE, "rb"))
 
-    print("正在构建向量索引（这可能需要一些时间，取决于模型 API 响应）...")
-    with open(MD_FILE, "r", encoding="utf-8") as f:
-        content = f.read()
-    
-    # 简单切分：按双换行切分段落
-    chunks = [c.strip() for c in content.split("\n\n") if len(c.strip()) > 20]
-    
-    embeddings = []
-    start_time = time.time()
-    batch_start_time = time.time()
-    
-    for i, chunk in enumerate(chunks):
-        if i > 0 and i % 10 == 0:
-            batch_end_time = time.time()
-            batch_duration = batch_end_time - batch_start_time
-            print(f"已处理 {i}/{len(chunks)} 条记录... [最近10条耗时: {batch_duration:.2f}s]")
-            batch_start_time = time.time()
-            
-        embeddings.append(get_embedding(chunk))
-    
-    total_duration = time.time() - start_time
-    print(f"向量化任务结束。总耗时: {total_duration:.2f}s")
-    
-    embeddings = np.array(embeddings).astype('float32')
-    
-    # 创建 FAISS 索引
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    
-    faiss.write_index(index, INDEX_FILE)
-    pickle.dump(chunks, open(METADATA_FILE, "wb"))
-    
-    return index, chunks
+    print("错误: 索引文件缺失。请先运行 scripts/rebuild_data_from_docx.py 生成索引。")
+    return None, None
 
 def vector_search(query, index, chunks, k=4):
     """执行语义检索并返回结果与得分"""
@@ -213,6 +184,13 @@ def main():
         # 4. 生成回答
         final_answer = rag_answer(query, combined_context)
         
+        print("\n" + "="*25 + " 检索到的参考资料 " + "="*25)
+        if combined_context.strip():
+            print(combined_context)
+        else:
+            print("未检索到任何匹配资料。")
+        print("="*66)
+
         print("\n检索质量反馈:")
         if sql_res: print(" - [Hit] SQL 精确匹配成功")
         valid_vec_count = len([r for r in vec_res_raw if r['score'] < 500])
