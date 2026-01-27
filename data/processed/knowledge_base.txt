@@ -1,0 +1,7 @@
+这是一个测试文件，无意义。
+Python是一种高级编程语言，广泛用于Web开发、数据科学和人工智能。
+C++是一种编程语言，常用于系统编程和游戏开发。
+机器学习是人工智能的一个分支，专注于让计算机从数据中学习。
+深度学习是机器学习的一个子领域，使用神经网络进行学习。
+上海大学是中国的一所211院校，有计算机学院。
+瑞典皇家科学院于北京时间2025年10月7日宣布，将2025年诺贝尔物理学奖授予美国加州大学伯克利分校约翰·克拉克（John Clarke）、耶鲁大学米歇尔·德沃雷（Michel H. Devoret）与加州大学圣芭芭拉分校约翰·马丁尼斯（John M. Martinis），以表彰他们在“电路中实现宏观量子隧穿与能级量子化（for the discovery of macroscopic quantum mechanical tunnelling and energy quantization in an electric circuit）”的杰出贡献。

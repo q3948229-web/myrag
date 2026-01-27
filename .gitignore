@@ -1,3 +1,11 @@
 .venv/
 .vscode/
-knowledge_base.txt
+config_api.py
+data/processed/handbook.db
+data/processed/*.bin
+data/processed/*.pkl
+data/processed/*.json
+data/processed/*.sql
+!data/processed/shanghai_university_handbook_2025_refined.sql
+data/raw/*.pdf
+
