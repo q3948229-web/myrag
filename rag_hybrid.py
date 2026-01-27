@@ -61,11 +61,13 @@ def sql_exact_search(query_text):
     match_chapter = re.search(r'第[一二三四五六七八九十百]+章', query_text)
     if match_chapter:
         chapter_num = match_chapter.group()
-        # 模糊匹配章节名
-        cursor.execute("SELECT chapter, raw_content FROM handbook_nodes WHERE chapter LIKE ?", (f'%{chapter_num}%',))
-        res = cursor.fetchone()
-        if res:
-            return f"【SQL精确找到 {res[0]}】：\n{res[1]}"
+        # 模糊匹配章节名，获取该章节下所有的条款内容
+        cursor.execute("SELECT chapter, raw_content FROM handbook_nodes WHERE chapter LIKE ? ORDER BY id", (f'%{chapter_num}%',))
+        rows = cursor.fetchall()
+        if rows:
+            chapter_name = rows[0][0]
+            full_chapter_content = "\n".join([row[1] for row in rows])
+            return f"【SQL精确找到 {chapter_name} 完整内容】：\n{full_chapter_content}"
             
     return None
 
@@ -85,7 +87,7 @@ def build_vector_index():
     print("错误: 索引文件缺失。请先运行 scripts/rebuild_data_from_docx.py 生成索引。")
     return None, None
 
-def vector_search(query, index, chunks, k=4):
+def vector_search(query, index, chunks, k=6):
     """执行语义检索并返回结果与得分"""
     query_vec = np.array([get_embedding(query)]).astype('float32')
     distances, indices = index.search(query_vec, k)
@@ -173,8 +175,8 @@ def main():
         # 1. 尝试 SQL 精确匹配
         sql_res = sql_exact_search(query)
         
-        # 2. 向量语义查询 (召回 4 个候选项进行过滤)
-        vec_res_raw = vector_search(query, index, chunks, k=4)
+        # 2. 向量语义查询 (召回 6 个候选项进行过滤)
+        vec_res_raw = vector_search(query, index, chunks, k=6)
         
         # 3. 后处理：去重、过滤、格式化
         combined_context = process_retrieval_results(sql_res, vec_res_raw)
