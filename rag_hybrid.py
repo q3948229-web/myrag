@@ -16,6 +16,7 @@ except ImportError:
 # ================= 配置区 =================
 # 如果你有实际的 API 密钥和地址，请在此填入
 # 这里默认使用 OpenAI 标准接口格式
+# 如果使用本地部署，请确保 BASE_URL 指向你的服务地址
 client = OpenAI(
     api_key=API_KEY, 
     base_url=BASE_URL
