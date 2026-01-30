@@ -71,6 +71,33 @@ def sql_exact_search(query_text):
             
     return None
 
+def sql_keyword_search(query_text):
+    """基于核心关键词的 SQL 检索 (方案 C)"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # 定义高频业务关键词列表
+    keywords = ["转专业", "休学", "复学", "退学", "绩点", "平均学分绩点", 
+               "违纪", "作弊", "处分", "学位", "毕业设计", "补考", "重修",
+               "考勤", "请假", "缓考", "免听", "辅修", "选修", "社团"]
+    
+    found_keywords = [kw for kw in keywords if kw in query_text]
+    if not found_keywords:
+        return None
+        
+    all_results = []
+    for kw in found_keywords:
+        # 优先从标题匹配，其次是内容，限制每个词最多召回 2 条最相关的
+        cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_title LIKE ? OR raw_content LIKE ? LIMIT 2", (f'%{kw}%', f'%{kw}%'))
+        rows = cursor.fetchall()
+        for row in rows:
+            all_results.append(f"【SQL关键词寻踪 - {row[0]}】：\n{row[1]}")
+            
+    if all_results:
+        # 去重并拼接
+        return "\n\n".join(list(set(all_results)))
+    return None
+
 # ================= 向量搜索模块 =================
 def get_embedding(text):
     """通过 OpenAI 接口获取向量"""
@@ -138,7 +165,7 @@ def process_retrieval_results(sql_res, vec_results, threshold=500.0):
 # ================= RAG 流程模块 =================
 def rag_answer(query, context):
     """调用 LLM 生成回答"""
-    system_prompt = "你是一位上海大学学生手册助手。请根据提供的参考资料回答用户问题。如果资料中没有，请礼貌告知。回复应简洁、准确。"
+    system_prompt = "你是一位上海大学学生手册助手。请根据提供的参考资料回答用户问题。如果资料中没有，请礼貌告知。回复应详实、准确。"
     user_prompt = f"参考资料：\n{context}\n\n问题：{query}"
     
     response = client.chat.completions.create(
@@ -172,8 +199,10 @@ def main():
             
         print("\n[系统思考中...]")
         
-        # 1. 尝试 SQL 精确匹配
+        # 1. 尝试 SQL 精确匹配与关键词匹配 (方案 C)
         sql_res = sql_exact_search(query)
+        if not sql_res:
+            sql_res = sql_keyword_search(query)
         
         # 2. 向量语义查询 (召回 6 个候选项进行过滤)
         vec_res_raw = vector_search(query, index, chunks, k=6)
@@ -195,7 +224,9 @@ def main():
         print("="*66)
 
         print("\n检索质量反馈:")
-        if sql_res: print(" - [Hit] SQL 精确匹配成功")
+        if sql_res:
+            hit_type = "精确条款" if "【官方授权精确条款】" in sql_res or "精确找到" in sql_res else "关键词召回"
+            print(f" - [Hit] SQL {hit_type}成功")
         valid_vec_count = len([r for r in vec_res_raw if r['score'] < 500])
         print(f" - [Recall] 向量召回有效片段: {valid_vec_count}")
         
