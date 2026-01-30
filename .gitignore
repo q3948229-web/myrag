@@ -8,4 +8,6 @@ data/processed/*.json
 data/processed/*.sql
 !data/processed/shanghai_university_handbook_2025_refined.sql
 data/raw/*.pdf
+conda_list_back.txt
+1.txt
 
