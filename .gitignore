@@ -11,4 +11,4 @@ data/raw/*.pdf
 conda_list_back.txt
 *.txt
 TODO_list.txt
-./__pycache__/
+__pycache__/
