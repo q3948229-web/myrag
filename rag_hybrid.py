@@ -4,6 +4,7 @@ import faiss
 import numpy as np
 import pickle
 import re
+import time
 from openai import OpenAI
 try:
     from config_api import API_KEY, BASE_URL, MODEL_LLM, MODEL_EMBEDDING
@@ -14,224 +15,193 @@ except ImportError:
     MODEL_EMBEDDING = "Qwen3-Embedding-8B"
 
 # ================= 配置区 =================
-# 如果你有实际的 API 密钥和地址，请在此填入
-# 这里默认使用 OpenAI 标准接口格式
-# 如果使用本地部署，请确保 BASE_URL 指向你的服务地址
-client = OpenAI(
-    api_key=API_KEY, 
-    base_url=BASE_URL
-)
-
 SQL_FILE = "d:/myrag/data/processed/shanghai_university_handbook_2025_refined.sql"
 DB_FILE = "d:/myrag/data/processed/handbook.db"
-MD_FILE = "d:/myrag/data/processed/2025年本科生学生手册_refined.md"
 INDEX_FILE = "d:/myrag/data/processed/vector_index.bin"
 METADATA_FILE = "d:/myrag/data/processed/metadata.pkl"
 
-# ================= SQL 处理模块 =================
-def init_sqlite():
-    """将 SQL 文件导入 SQLite 数据库"""
-    if os.path.exists(DB_FILE):
+class SHUHandbookBot:
+    def __init__(self):
+        self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        self.conn = self._init_sqlite()
+        self.index, self.chunks = self._load_vector_index()
+        self.chat_history = []  # 存储对话历史 (角色, 内容)
+        self.max_history = 5     # 保留最近5轮对话进行重写
+        print(f"✅ 系统初始化完成。模型: {MODEL_LLM}")
+
+    def _init_sqlite(self):
+        """将 SQL 文件导入 SQLite 数据库"""
+        if not os.path.exists(DB_FILE):
+            print("正在初始化 SQLite 数据库...")
+            conn = sqlite3.connect(DB_FILE)
+            with open(SQL_FILE, 'r', encoding='utf-8') as f:
+                sql_script = f.read()
+            conn.executescript(sql_script)
+            conn.commit()
+            return conn
         return sqlite3.connect(DB_FILE)
-    
-    print("正在初始化 SQLite 数据库...")
-    conn = sqlite3.connect(DB_FILE)
-    with open(SQL_FILE, 'r', encoding='utf-8') as f:
-        sql_script = f.read()
-    conn.executescript(sql_script)
-    conn.commit()
-    return conn
 
-def sql_exact_search(query_text):
-    """基于规则的 SQL 精确检索"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # 尝试匹配 "第X条"
-    match_article = re.search(r'第[一二三四五六七八九十百]+条', query_text)
-    if match_article:
-        article_num = match_article.group()
-        # 匹配新数据库中的 article_num 字段
-        cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_num = ?", (article_num,))
-        res = cursor.fetchone()
-        if res:
-            return f"【SQL精确找到 {res[0]}】：\n{res[1]}"
-            
-    # 尝试匹配 "第X章"
-    match_chapter = re.search(r'第[一二三四五六七八九十百]+章', query_text)
-    if match_chapter:
-        chapter_num = match_chapter.group()
-        # 模糊匹配章节名，获取该章节下所有的条款内容
-        cursor.execute("SELECT chapter, raw_content FROM handbook_nodes WHERE chapter LIKE ? ORDER BY id", (f'%{chapter_num}%',))
-        rows = cursor.fetchall()
-        if rows:
-            chapter_name = rows[0][0]
-            full_chapter_content = "\n".join([row[1] for row in rows])
-            return f"【SQL精确找到 {chapter_name} 完整内容】：\n{full_chapter_content}"
-            
-    return None
+    def _load_vector_index(self):
+        """加载向量索引"""
+        if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
+            return faiss.read_index(INDEX_FILE), pickle.load(open(METADATA_FILE, "rb"))
+        print("错误: 索引文件缺失。")
+        return None, None
 
-def sql_keyword_search(query_text):
-    """基于核心关键词的 SQL 检索 (方案 C)"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # 定义高频业务关键词列表
-    keywords = ["转专业", "休学", "复学", "退学", "绩点", "平均学分绩点", 
-               "违纪", "作弊", "处分", "学位", "毕业设计", "补考", "重修",
-               "考勤", "请假", "缓考", "免听", "辅修", "选修", "社团"]
-    
-    found_keywords = [kw for kw in keywords if kw in query_text]
-    if not found_keywords:
+    def _get_embedding(self, text):
+        """获取向量"""
+        text = text.replace("\n", " ")
+        return self.client.embeddings.create(input=[text], model=MODEL_EMBEDDING).data[0].embedding
+
+    def rewrite_query(self, query):
+        """结合历史改写查询提升检索精度"""
+        if not self.chat_history:
+            return query
+        
+        # 构造对话背景
+        history_str = "\n".join([f"{m['role']}: {m['content']}" for m in self.chat_history[-self.max_history:]])
+        system_prompt = (
+            "你是一个查询重写助手。请结合对话历史，将用户的最新问题改写为一个完整的、独立的查询语句。\n"
+            "要求：1. 补全缺失的主语/宾语；2. 保持简洁；3. 直接输出改写后的句子，不要有任何解释。"
+        )
+        user_prompt = f"对话历史：\n{history_str}\n\n当前问题：{query}\n\n完整查询："
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL_LLM,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1
+            )
+            rewritten = response.choices[0].message.content.strip()
+            return rewritten if rewritten else query
+        except:
+            return query
+
+    def sql_exact_search(self, query_text):
+        """基于规则的 SQL 精确检索"""
+        cursor = self.conn.cursor()
+        # 尝试匹配 "第X条"
+        match_article = re.search(r'第[一二三四五六七八九十百]+条', query_text)
+        if match_article:
+            article_num = match_article.group()
+            cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_num = ?", (article_num,))
+            res = cursor.fetchone()
+            if res: return f"【SQL精确查得 - {res[0]}】：\n{res[1]}"
+                
+        # 尝试匹配 "第X章"
+        match_chapter = re.search(r'第[一二三四五六七八九十百]+章', query_text)
+        if match_chapter:
+            chapter_num = match_chapter.group()
+            cursor.execute("SELECT chapter, raw_content FROM handbook_nodes WHERE chapter LIKE ? ORDER BY id", (f'%{chapter_num}%',))
+            rows = cursor.fetchall()
+            if rows:
+                content = "\n".join([row[1] for row in rows])
+                return f"【SQL精确查得 - {rows[0][0]} 完整内容】：\n{content}"
         return None
+
+    def sql_keyword_search(self, query_text):
+        """基于核心关键词的 SQL 检索"""
+        cursor = self.conn.cursor()
+        keywords = ["转专业", "休学", "复学", "退学", "绩点", "学分", "违纪", "作弊", "处分", 
+                   "学位", "毕业", "补考", "重修", "考勤", "请假", "缓考", "免听", "辅修", "社团"]
         
-    all_results = []
-    for kw in found_keywords:
-        # 优先从标题匹配，其次是内容，限制每个词最多召回 2 条最相关的
-        cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_title LIKE ? OR raw_content LIKE ? LIMIT 2", (f'%{kw}%', f'%{kw}%'))
-        rows = cursor.fetchall()
-        for row in rows:
-            all_results.append(f"【SQL关键词寻踪 - {row[0]}】：\n{row[1]}")
+        found_kws = [kw for kw in keywords if kw in query_text]
+        if not found_kws: return None
             
-    if all_results:
-        # 去重并拼接
-        return "\n\n".join(list(set(all_results)))
-    return None
+        results = []
+        for kw in found_kws:
+            cursor.execute("SELECT path, raw_content FROM handbook_nodes WHERE article_title LIKE ? OR raw_content LIKE ? LIMIT 2", (f'%{kw}%', f'%{kw}%'))
+            for row in cursor.fetchall():
+                results.append(f"【SQL关键词命中 - {row[0]}】：\n{row[1]}")
+        return "\n\n".join(list(set(results))) if results else None
 
-# ================= 向量搜索模块 =================
-def get_embedding(text):
-    """通过 OpenAI 接口获取向量"""
-    text = text.replace("\n", " ")
-    return client.embeddings.create(input=[text], model=MODEL_EMBEDDING).data[0].embedding
-
-import time
-
-def build_vector_index():
-    """构建向量索引"""
-    if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
-        return faiss.read_index(INDEX_FILE), pickle.load(open(METADATA_FILE, "rb"))
-
-    print("错误: 索引文件缺失。请先运行 scripts/rebuild_data_from_docx.py 生成索引。")
-    return None, None
-
-def vector_search(query, index, chunks, k=6):
-    """执行语义检索并返回结果与得分"""
-    query_vec = np.array([get_embedding(query)]).astype('float32')
-    distances, indices = index.search(query_vec, k)
-    
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx != -1:
-            results.append({
-                "content": chunks[idx],
-                "score": float(dist)
-            })
-    return results
-
-def process_retrieval_results(sql_res, vec_results, threshold=500.0):
-    """
-    对检索结果进行后处理：去重、分发标签、按阈值过滤。
-    L2 距离越小表示越相似。
-    """
-    final_context_parts = []
-    seen_content_snippets = set()
-
-    # 1. 处理 SQL 精确匹配结果 (最高优先级)
-    if sql_res:
-        label = "【官方授权精确条款】"
-        final_context_parts.append(f"{label}\n{sql_res}")
-        # 将前50个字符存入去重集合
-        seen_content_snippets.add(sql_res[:50].strip())
-
-    # 2. 处理向量检索结果
-    for item in vec_results:
-        content = item["content"]
-        score = item["score"]
-
-        # 阈值过滤 (根据 L2 距离，太大则认为不相关)
-        if score > threshold:
-            continue
+    def vector_search(self, query, k=6):
+        """执行语义检索"""
+        query_vec = np.array([self._get_embedding(query)]).astype('float32')
+        distances, indices = self.index.search(query_vec, k)
         
-        # 简单语义去重：如果该段落开头已在 SQL 结果中出现，则跳过
-        snippet = content[:50].strip()
-        if snippet in seen_content_snippets:
-            continue
-            
-        final_context_parts.append(f"【参考文本 (相似度得分:{score:.2f})】\n{content}")
-        seen_content_snippets.add(snippet)
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx != -1:
+                results.append({"content": self.chunks[idx], "score": float(dist)})
+        return results
 
-    return "\n\n---\n\n".join(final_context_parts)
+    def process_retrieval(self, sql_res, vec_results, threshold=550.0):
+        """去重与合并"""
+        final_parts = []
+        seen = set()
 
-# ================= RAG 流程模块 =================
-def rag_answer(query, context):
-    """调用 LLM 生成回答"""
-    system_prompt = "你是一位上海大学学生手册助手。请根据提供的参考资料回答用户问题。如果资料中没有，请礼貌告知。回复应详实、准确。"
-    user_prompt = f"参考资料：\n{context}\n\n问题：{query}"
-    
-    response = client.chat.completions.create(
-        model=MODEL_LLM,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.3
-    )
-    return response.choices[0].message.content
+        if sql_res:
+            final_parts.append(f"【权威数据源】\n{sql_res}")
+            seen.add(sql_res[:50].strip())
+
+        for item in vec_results:
+            if item["score"] > threshold: continue
+            snippet = item["content"][:50].strip()
+            if snippet not in seen:
+                final_parts.append(f"【语义参考 (得分:{item['score']:.2f})】\n{item['content']}")
+                seen.add(snippet)
+        return "\n\n---\n\n".join(final_parts)
+
+    def ask(self, query):
+        """全流程入口"""
+        # 1. 查询重写
+        search_query = self.rewrite_query(query)
+        if search_query != query:
+            print(f"🔍 查询已优化: {search_query}")
+
+        # 2. 混合检索
+        sql_res = self.sql_exact_search(search_query)
+        if not sql_res:
+            sql_res = self.sql_keyword_search(search_query)
+        
+        vec_res = self.vector_search(search_query)
+        context = self.process_retrieval(sql_res, vec_res)
+
+        # 3. 生成回答
+        system_prompt = "你是一位上海大学学生手册助手。请根据参考资料准确回答。若资料不足请说明。回复应详实、清晰。"
+        user_prompt = f"参考资料：\n{context}\n\n问题：{query}"
+        
+        response = self.client.chat.completions.create(
+            model=MODEL_LLM,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        answer = response.choices[0].message.content
+        
+        # 4. 更新历史
+        self.chat_history.append({"role": "user", "content": query})
+        self.chat_history.append({"role": "assistant", "content": answer})
+        
+        return answer, context, search_query
 
 # ================= 主循环 =================
 def main():
-    # 初始化
-    init_sqlite()
-    index, chunks = build_vector_index()
-    
+    bot = SHUHandbookBot()
     print("\n" + "="*50)
-    print("上海大学 2025 本科生手册 RAG 系统 (混合模式)")
-    print("模型: LLM=" + MODEL_LLM + " / Embedding=" + MODEL_EMBEDDING)
-    print("输入 'exit' 退出")
+    print("上海大学 2025 本科生手册 智能大脑 (Pro版)")
+    print("能力: SQL匹配 + 语义召回 + 对话记忆 + 自动改写")
     print("="*50 + "\n")
     
     while True:
         query = input("用户问题 >> ").strip()
-        if query.lower() in ['exit', 'quit', '退出']:
-            break
-        if not query:
-            continue
+        if query.lower() in ['exit', 'quit', '退出']: break
+        if not query: continue
             
-        print("\n[系统思考中...]")
-        
-        # 1. 尝试 SQL 精确匹配与关键词匹配 (方案 C)
-        sql_res = sql_exact_search(query)
-        if not sql_res:
-            sql_res = sql_keyword_search(query)
-        
-        # 2. 向量语义查询 (召回 6 个候选项进行过滤)
-        vec_res_raw = vector_search(query, index, chunks, k=6)
-        
-        # 3. 后处理：去重、过滤、格式化
-        combined_context = process_retrieval_results(sql_res, vec_res_raw)
-        
-        if not combined_context.strip():
-            print("⚠ 警告：未找到相关规章内容，回答可能受限。")
-
-        # 4. 生成回答
-        final_answer = rag_answer(query, combined_context)
+        print("\n[🧠 思考中...]")
+        answer, context, rewritten = bot.ask(query)
         
         print("\n" + "="*25 + " 检索到的参考资料 " + "="*25)
-        if combined_context.strip():
-            print(combined_context)
-        else:
-            print("未检索到任何匹配资料。")
+        print(context if context.strip() else "未检索到匹配资料。")
         print("="*66)
 
-        print("\n检索质量反馈:")
-        if sql_res:
-            hit_type = "精确条款" if "【官方授权精确条款】" in sql_res or "精确找到" in sql_res else "关键词召回"
-            print(f" - [Hit] SQL {hit_type}成功")
-        valid_vec_count = len([r for r in vec_res_raw if r['score'] < 500])
-        print(f" - [Recall] 向量召回有效片段: {valid_vec_count}")
-        
-        print("\n" + "-"*30 + " 助手回答 " + "-"*30)
-        print(final_answer)
+        print(f"\n[AI 回答]\n{answer}")
         print("-" * 70 + "\n")
 
 if __name__ == "__main__":
